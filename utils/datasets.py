@@ -355,7 +355,7 @@ class LoadStreams:  # multiple IP or RTSP cameras
 
 def img2label_paths(img_paths):
     # Define label paths as a function of image paths
-    sa, sb = os.sep + 'images' + os.sep, os.sep + 'labels' + os.sep  # /images/, /labels/ substrings
+    sa, sb = os.sep + 'images' + os.sep, os.sep + 'labels_yolo_MONO_2D' + os.sep  # /images/, /labels/ substrings
     return [sb.join(x.rsplit(sa, 1)).rsplit('.', 1)[0] + '.txt' for x in img_paths]
 
 
@@ -425,7 +425,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                 x[:, 0] = 0
 
         n = len(shapes)  # number of images
-        bi = np.floor(np.arange(n) / batch_size).astype(np.int)  # batch index
+        bi = np.floor(np.arange(n) / batch_size).astype(np.int32)  # batch index
         nb = bi[-1] + 1  # number of batches
         self.batch = bi  # batch index of image
         self.n = n
@@ -453,7 +453,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                 elif mini > 1:
                     shapes[i] = [1, 1 / mini]
 
-            self.batch_shapes = np.ceil(np.array(shapes) * img_size / stride + pad).astype(np.int) * stride
+            self.batch_shapes = np.ceil(np.array(shapes) * img_size / stride + pad).astype(np.int32) * stride
 
         # Cache images into memory for faster training (WARNING: large datasets may exceed system RAM)
         self.imgs = [None] * n
@@ -809,7 +809,7 @@ def extract_boxes(path='../datasets/coco128'):  # from utils.datasets import *; 
                     b = x[1:] * [w, h, w, h]  # box
                     # b[2:] = b[2:].max()  # rectangle to square
                     b[2:] = b[2:] * 1.2 + 3  # pad
-                    b = xywh2xyxy(b.reshape(-1, 4)).ravel().astype(np.int)
+                    b = xywh2xyxy(b.reshape(-1, 4)).ravel().astype(np.int32)
 
                     b[[0, 2]] = np.clip(b[[0, 2]], 0, w)  # clip boxes outside of image
                     b[[1, 3]] = np.clip(b[[1, 3]], 0, h)

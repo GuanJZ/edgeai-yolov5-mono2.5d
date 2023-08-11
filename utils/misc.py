@@ -38,13 +38,24 @@ def remove_if_exists(path):
             raise
 
 
+
+def symlink_force(target, link_name):
+    try:
+        os.symlink(target, link_name)
+    except OSError as e:
+        if e.errno == errno.EEXIST:
+            os.remove(link_name)
+            os.symlink(target, link_name)
+        else:
+            raise e
+
 def make_symlink(source, dest):
     remove_if_exists(dest)
     if os.path.dirname(source) == os.path.dirname(dest):
         base_dir = os.path.dirname(source)
         cur_dir = os.getcwd()
         os.chdir(base_dir)
-        os.symlink(os.path.basename(source), os.path.basename(dest))
+        symlink_force(os.path.basename(source), os.path.basename(dest))
         os.chdir(cur_dir)
     else:
         os.symlink(source, dest)

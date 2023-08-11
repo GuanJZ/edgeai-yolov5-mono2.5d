@@ -114,14 +114,14 @@ def export_prototxt(model, img, file, simple_search):
     detection_output_param = tidl_meta_arch_yolov5_pb2.TIDLOdPostProc(num_classes=num_classes, share_location=True,
                                             background_label_id=background_label_id, nms_param=nms_param,
                                             code_type=tidl_meta_arch_yolov5_pb2.CODE_TYPE_YOLO_V5, keep_top_k=300,
-                                            confidence_threshold=0.005)
+                                            confidence_threshold=0.5)
 
-    yolov3 = tidl_meta_arch_yolov5_pb2.TidlYoloOd(name='yolo_v3', output=["detections"],
+    yolov5 = tidl_meta_arch_yolov5_pb2.TidlYoloOd(name='yolo_v5', output=["detections"],
                                             in_width=img.shape[3], in_height=img.shape[2],
                                             yolo_param=yolo_params,
                                             detection_output_param=detection_output_param,
                                             )
-    arch = tidl_meta_arch_yolov5_pb2.TIDLMetaArch(name='yolo_v3', tidl_yolo=[yolov3])
+    arch = tidl_meta_arch_yolov5_pb2.TIDLMetaArch(name='yolo_v5', tidl_yolo=[yolov5])
 
     with open(prototxt_name, 'wt') as pfile:
         txt_message = text_format.MessageToString(arch)

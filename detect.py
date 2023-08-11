@@ -229,7 +229,7 @@ def parse_opt():
 
 def main(opt):
     print(colorstr('detect: ') + ', '.join(f'{k}={v}' for k, v in vars(opt).items()))
-    check_requirements(exclude=('tensorboard', 'thop'))
+    # check_requirements(exclude=('tensorboard', 'thop'))
     run(**vars(opt))
 
 

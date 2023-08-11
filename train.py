@@ -219,8 +219,8 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
             # c = torch.tensor(labels[:, 0])  # classes
             # cf = torch.bincount(c.long(), minlength=nc) + 1.  # frequency
             # model._initialize_biases(cf.to(device))
-            if plots:
-                plot_labels(labels, names, save_dir, loggers)
+            # if plots:
+            #     plot_labels(labels, names, save_dir, loggers)
 
             # Anchors
             if not opt.noautoanchor:
@@ -347,7 +347,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
             loggers.on_train_epoch_end(epoch)
             ema.update_attr(model, include=['yaml', 'nc', 'hyp', 'names', 'stride', 'class_weights'])
             final_epoch = epoch + 1 == epochs
-            if not noval or final_epoch:  # Calculate mAP
+            if epoch % 10 == 0 or final_epoch:  # Calculate mAP
                 results, maps, _ = val.run(data_dict,
                                            batch_size=batch_size // WORLD_SIZE * 2,
                                            imgsz=imgsz,
@@ -458,7 +458,7 @@ def main(opt):
         print(colorstr('train: ') + ', '.join(f'{k}={v}' for k, v in vars(opt).items()))
         if not opt.disable_git_status:
             check_git_status()
-        check_requirements(exclude=['thop'])
+        # check_requirements(exclude=['thop'])
 
     # Resume
     if opt.resume and not check_wandb_resume(opt):  # resume an interrupted run
