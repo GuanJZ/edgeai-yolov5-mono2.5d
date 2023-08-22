@@ -355,7 +355,7 @@ class LoadStreams:  # multiple IP or RTSP cameras
 
 def img2label_paths(img_paths):
     # Define label paths as a function of image paths
-    sa, sb = os.sep + 'images' + os.sep, os.sep + 'labels_yolo_MONO_2D' + os.sep  # /images/, /labels/ substrings
+    sa, sb = os.sep + 'images' + os.sep, os.sep + 'labels_yolo_MONO_2.5D' + os.sep  # /images/, /labels/ substrings
     return [sb.join(x.rsplit(sa, 1)).rsplit('.', 1)[0] + '.txt' for x in img_paths]
 
 
@@ -538,7 +538,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
 
             labels = self.labels[index].copy()
             if labels.size:  # normalized xywh to pixel xyxy format
-                labels[:, 1:] = xywhn2xyxy(labels[:, 1:], ratio[0] * w, ratio[1] * h, padw=pad[0], padh=pad[1])
+                labels[:, 1:5] = xywhn2xyxy(labels[:, 1:5], ratio[0] * w, ratio[1] * h, padw=pad[0], padh=pad[1])
 
             if self.augment:
                 img, labels = random_perspective(img, labels,
@@ -574,7 +574,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
             # Cutouts
             # labels = cutout(img, labels, p=0.5)
 
-        labels_out = torch.zeros((nl, 6))
+        labels_out = torch.zeros((nl, 22))
         if nl:
             labels_out[:, 1:] = torch.from_numpy(labels)
 
@@ -669,14 +669,14 @@ def load_mosaic(self, index):
         # Labels
         labels, segments = self.labels[index].copy(), self.segments[index].copy()
         if labels.size:
-            labels[:, 1:] = xywhn2xyxy(labels[:, 1:], w, h, padw, padh)  # normalized xywh to pixel xyxy format
+            labels[:, 1:5] = xywhn2xyxy(labels[:, 1:5], w, h, padw, padh)  # normalized xywh to pixel xyxy format
             segments = [xyn2xy(x, w, h, padw, padh) for x in segments]
         labels4.append(labels)
         segments4.extend(segments)
 
     # Concat/clip labels
     labels4 = np.concatenate(labels4, 0)
-    for x in (labels4[:, 1:], *segments4):
+    for x in (labels4[:, 1:5], *segments4):
         np.clip(x, 0, 2 * s, out=x)  # clip when using random_perspective()
     # img4, labels4 = replicate(img4, labels4)  # replicate
 
@@ -862,22 +862,29 @@ def verify_image_label(args):
             nf = 1  # label found
             with open(lb_file, 'r') as f:
                 l = [x.split() for x in f.read().strip().splitlines() if len(x)]
-                if any([len(x) > 8 for x in l]):  # is segment
-                    classes = np.array([x[0] for x in l], dtype=np.float32)
-                    segments = [np.array(x[1:], dtype=np.float32).reshape(-1, 2) for x in l]  # (cls, xy1...)
-                    l = np.concatenate((classes.reshape(-1, 1), segments2boxes(segments)), 1)  # (cls, xywh)
+                l = [
+                    [float(lb) for lb in lbs] for lbs in l
+                ]
+
+                l = [
+                    lbs for lbs in l if abs(lbs[5]) >= 1e-6 and abs(lbs[6]) >= 1e-6 and abs(lbs[7]) >= 1e-6
+                ]
+                # if any([len(x) > 8 for x in l]):  # is segment
+                #     classes = np.array([x[0] for x in l], dtype=np.float32)
+                #     segments = [np.array(x[1:], dtype=np.float32).reshape(-1, 2) for x in l]  # (cls, xy1...)
+                #     l = np.concatenate((classes.reshape(-1, 1), segments2boxes(segments)), 1)  # (cls, xywh)
                 l = np.array(l, dtype=np.float32)
             if len(l):
-                assert l.shape[1] == 5, 'labels require 5 columns each'
-                assert (l >= 0).all(), 'negative labels'
-                assert (l[:, 1:] <= 1).all(), 'non-normalized or out of bounds coordinate labels'
+                assert l.shape[1] == 21, 'labels require 5 columns each'
+                assert (l[:, :5] >= 0).all(), 'negative labels'
+                assert (l[:, 1:5] <= 1).all(), 'non-normalized or out of bounds coordinate labels'
                 assert np.unique(l, axis=0).shape[0] == l.shape[0], 'duplicate labels'
             else:
                 ne = 1  # label empty
-                l = np.zeros((0, 5), dtype=np.float32)
+                l = np.zeros((0, 21), dtype=np.float32)
         else:
             nm = 1  # label missing
-            l = np.zeros((0, 5), dtype=np.float32)
+            l = np.zeros((0, 21), dtype=np.float32)
         return im_file, l, shape, segments, nm, nf, ne, nc, ''
     except Exception as e:
         nc = 1

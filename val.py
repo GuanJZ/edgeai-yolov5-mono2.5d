@@ -15,6 +15,7 @@ import numpy as np
 import torch
 import yaml
 from tqdm import tqdm
+import shutil
 
 FILE = Path(__file__).absolute()
 sys.path.append(FILE.parents[0].as_posix())  # add yolov5/ to path
@@ -50,6 +51,40 @@ def save_one_json(predn, jdict, path, class_map):
                       'bbox': [round(x, 3) for x in b],
                       'score': round(p[4], 5)})
 
+def calc_theta_ray(width, box_2d, proj_matrix):
+    fovx = 2 * np.arctan(width / (2 * proj_matrix[0, 0]))
+    center = (box_2d[:, 2] + box_2d[:, 0]) / 2
+    dx = center - (width / 2)
+
+    if dx.shape[0] == 1:
+        mult = -np.ones(dx.shape) if dx[0] < 0 else -np.ones(dx.shape)
+    else:
+        mult = np.ones(dx.shape)
+        mult[dx < 0] = -1
+    dx = np.abs(dx)
+    theta = np.arctan((2 * dx * np.tan(fovx / 2)) / width)
+    theta = theta * mult
+
+    return theta
+
+def compute_location(detections, labels):
+    """
+    iou>=0.5的情况下,detetcions 匹配到labels,从而得到 detections的location
+    :param detections:
+    :param labels:
+    :return:
+    """
+    iou = box_iou(detections[:, :4], labels[:, 1:5])
+    x = torch.where(iou >= 1e-6)
+    matches = None
+    if x[0].shape[0]:
+        matches = torch.cat((torch.stack(x, 1), iou[x[0], x[1]][:, None]), 1).cpu().numpy()
+        if x[0].shape[0] > 1:
+            matches = matches[matches[:, 2].argsort()[::-1]]
+            # matches = matches[np.unique(matches[:, 1], return_index=True)[1]]
+            # matches = matches[matches[:, 2].argsort()[::-1]]
+            matches = matches[np.unique(matches[:, 0], return_index=True)[1]]
+    return matches
 
 def process_batch(predictions, labels, iouv):
     # Evaluate 1 batch of predictions
@@ -100,6 +135,7 @@ def run(data,
         plots=True,
         loggers=Loggers(),
         compute_loss=None,
+        do_3d=False,
         ):
     # Initialize/load model and set device
     training = model is not None
@@ -127,6 +163,16 @@ def run(data,
             data = yaml.safe_load(f)
         check_dataset(data)  # check
 
+    if do_3d:
+        # 3d predicts
+        preds_3d, labels_3d, img_paths = [], [], []
+        save_pred_3d = True
+        if save_pred_3d:
+            pred_3d_save_dir = os.path.join(save_dir, "pred_results")
+            if os.path.exists(pred_3d_save_dir):
+                shutil.rmtree(pred_3d_save_dir)
+            os.makedirs(pred_3d_save_dir)
+
     # Half
     half &= device.type != 'cpu'  # half precision only supported on CUDA
     if half:
@@ -153,7 +199,7 @@ def run(data,
     class_map = coco80_to_coco91_class() if is_coco else list(range(1000))
     s = ('%20s' + '%11s' * 6) % ('Class', 'Images', 'Labels', 'P', 'R', 'mAP@.5', 'mAP@.5:.95')
     p, r, f1, mp, mr, map50, map, t0, t1, t2 = 0., 0., 0., 0., 0., 0., 0., 0., 0., 0.
-    loss = torch.zeros(3, device=device)
+    loss = torch.zeros(6, device=device)
     jdict, stats, ap, ap_class = [], [], [], []
     for batch_i, (img, targets, paths, shapes) in enumerate(tqdm(dataloader, desc=s)):
         t_ = time_sync()
@@ -174,8 +220,8 @@ def run(data,
             loss += compute_loss([x.float() for x in train_out], targets)[1]  # box, obj, cls
 
         # Run NMS
-        targets[:, 2:] *= torch.Tensor([width, height, width, height]).to(device)  # to pixels
-        lb = [targets[targets[:, 0] == i, 1:] for i in range(nb)] if save_hybrid else []  # for autolabelling
+        targets[:, 2:6] *= torch.Tensor([width, height, width, height]).to(device)  # to pixels
+        lb = [targets[targets[:, 0] == i, 1:6] for i in range(nb)] if save_hybrid else []  # for autolabelling
         t = time_sync()
         out = non_max_suppression(out, conf_thres, iou_thres, labels=lb, multi_label=True, agnostic=single_cls)
         t2 += time_sync() - t
@@ -199,14 +245,94 @@ def run(data,
             predn = pred.clone()
             scale_coords(img[si].shape[1:], predn[:, :4], shape, shapes[si][1])  # native-space pred
 
+            # 1. hwl_log --> hwl
+            # predn
+            # from [x,y,x,y,conf,cls,h_log,w_log,l_log, cos1,sin1,cos2,sin2,conf1,conf2]
+            # to
+            # [x,y,x,y,conf,cls,h,w,l, cos1,sin1,cos2,sin2,conf1,conf2]
+            # predn[:, 6:9] = torch.exp(predn[:, 6:9]) 后处理已经操作, 这里是多余的
+
+            # 1.2 将角度normalize
+
+
+            # 2. theta
+            img_width = shapes[si][0][1]
+            intrinsic_path = paths[si].replace("images", "calibs").replace("jpg", "txt")
+            with open(intrinsic_path, 'r')as f:
+                parse_file = f.read().strip().splitlines()
+                for line in parse_file:
+                    if line is not None and line.split()[0] == "P2:":
+                        proj_matrix = np.array(line.split()[1:], dtype=np.float32).reshape(3, 4)
+            theta = calc_theta_ray(img_width, predn[:, :4].cpu().numpy(), proj_matrix)
+
+            # 3. alpha
+            orint, conf = predn[:, 9:13], predn[:, 13:15]
+            _, conf_idxs = torch.max(conf, dim=1)
+            alpha = torch.zeros(conf.shape[0])
+            for enum, orient_idx in enumerate(conf_idxs):
+                cos, sin = orint[enum, orient_idx * 2], orint[enum, orient_idx * 2 + 1]
+                # 因为数据预处理将alpha的区间从[-pi, pi]移动到[0, 2*pi], 所以这里还需要再减去pi, [-pi, pi]
+                alpha[enum] = torch.atan2(sin, cos) + (orient_idx + 0.5 - 1) * torch.pi
+
+            # 4. ry
+            Ry = torch.tensor(theta) + alpha
+
+            # predn
+            # from ([xyxy, conf, cls, (H, W_, L), ([cos1, sin1], [cos2, sin2]), (conf1, conf2)])
+            # to
+            # [xyxy, conf, cls, (H, W, L), Ry]
+            predn_processed = torch.cat((predn[:, :9], Ry[:, None].to(predn.device)), dim=1)
+
             # Evaluate
             if nl:
                 tbox = xywh2xyxy(labels[:, 1:5])  # target boxes
                 scale_coords(img[si].shape[1:], tbox, shape, shapes[si][1])  # native-space labels
-                labelsn = torch.cat((labels[:, 0:1], tbox), 1)  # native-space labels
-                correct = process_batch(predn, labelsn, iouv)
-                if plots:
-                    confusion_matrix.process_batch(predn, labelsn)
+                # labelsn
+                # from [cls, x, y, x, y, h, w, l, X, Y, Z, Ry, cos1, sin1, cos2, sin2, conf1, conf2, truncated, occluded, alpha]
+                # to
+                # [cls, x, y, x, y, h, w, l, X, Y, Z, Ry]
+                labelsn = torch.cat((labels[:, 0:1], tbox, labels[:, 5:12]), 1)  # native-space labels
+                correct = process_batch(predn_processed, labelsn, iouv)
+                # if plots:
+                #     confusion_matrix.process_batch(predn, labelsn)
+
+                if do_3d:
+                    matches = compute_location(predn_processed, labelsn)
+                    # predn3d
+                    # from predn [0:x, 1:y, 2:x, 3:y, 4:conf, 5:cls, 6:H, 7:W, 8:L, 9:Ry, 10:bbcp_x, 11:bbcp_y]
+                    # to
+                    # (ndarray)[cls, 0, 0, 0, x1, y1, x2, y2, H, W, L, X, Y, Z, Ry, conf, bbcp_x, bbcp_y]
+                    predn_3d = np.zeros((predn_processed.shape[0], 16))
+                    predn_arr = predn_processed.cpu().numpy()
+                    labelsn_arr = labelsn.cpu().numpy()
+                    if matches is not None:
+                        for enum, m in enumerate(matches):
+                            predn_3d[enum, 0] = predn_arr[int(m[0]), 5]
+                            predn_3d[enum, 4:8] = predn_arr[int(m[0]), :4]
+                            predn_3d[enum, 8:11] = predn_arr[int(m[0]), 6:9]
+                            predn_3d[enum, 11:14] = labelsn_arr[int(m[1]), 8:11]
+                            predn_3d[enum, 14] = predn_arr[int(m[0]), 9]
+                            predn_3d[enum, 15] = predn_arr[int(m[0]), 4]
+                            # predn_3d[enum, 16:18] = predn_arr[int(m[0]), 10:12]
+                    preds_3d.append(predn_3d)
+                    save_pred_3d = True
+                    if save_pred_3d:
+                        pred_3d_save_path = os.path.join(pred_3d_save_dir,
+                                                         os.path.basename(paths[si]).replace("jpg", "txt"))
+                        np.savetxt(pred_3d_save_path, predn_3d, delimiter=" ", fmt='%.08f')
+
+                    # labelsn_3d
+                    # from labelsn (cls, xyxy, HWL, XYZ, Ry, bbcp_x, bbcp_y)
+                    # to
+                    # (ndarray)[cls, 0, 0, 0, x1, y1, x2, y2, H, W, L, X, Y, Z, Ry, bbcp_x, bbcp_y]
+                    labelsn_3d = np.zeros((labelsn.shape[0], 15))
+                    labelsn_3d[:, 0] = labelsn_arr[:, 0]
+                    labelsn_3d[:, 4:8] = labelsn_arr[:, 1:5]
+                    labelsn_3d[:, 8:] = labelsn_arr[:, 5:]
+
+                    labels_3d.append(labelsn_3d)
+                    img_paths.append(paths[si])
+
             else:
                 correct = torch.zeros(pred.shape[0], niou, dtype=torch.bool)
             stats.append((correct.cpu(), pred[:, 4].cpu(), pred[:, 5].cpu(), tcls))  # (correct, conf, pcls, tcls)
@@ -218,17 +344,18 @@ def run(data,
                 save_one_json(predn, jdict, path, class_map)  # append to COCO-JSON dictionary
             loggers.on_val_batch_end(pred, predn, path, names, img[si])
 
-        # Plot images
-        if plots and batch_i < 3:
-            f = save_dir / f'val_batch{batch_i}_labels.jpg'  # labels
-            Thread(target=plot_images, args=(img, targets, paths, f, names), daemon=True).start()
-            f = save_dir / f'val_batch{batch_i}_pred.jpg'  # predictions
-            Thread(target=plot_images, args=(img, output_to_target(out), paths, f, names), daemon=True).start()
+        # # Plot images
+        # if plots and batch_i < 3:
+        #     f = save_dir / f'val_batch{batch_i}_labels.jpg'  # labels
+        #     Thread(target=plot_images, args=(img, targets, paths, f, names), daemon=True).start()
+        #     f = save_dir / f'val_batch{batch_i}_pred.jpg'  # predictions
+        #     Thread(target=plot_images, args=(img, output_to_target(out), paths, f, names), daemon=True).start()
 
     # Compute statistics
     stats = [np.concatenate(x, 0) for x in zip(*stats)]  # to numpy
     if len(stats) and stats[0].any():
         p, r, ap, f1, ap_class = ap_per_class(*stats, plot=plots, save_dir=save_dir, names=names)
+        # AP50_F1_max_idx = len(f1.mean(0)) - f1.mean(0)[::-1].argmax() - 1
         ap50, ap = ap[:, 0], ap.mean(1)  # AP@0.5, AP@0.5:0.95
         mp, mr, map50, map = p.mean(), r.mean(), ap50.mean(), ap.mean()
         nt = np.bincount(stats[3].astype(np.int64), minlength=nc)  # number of targets per class
@@ -252,8 +379,18 @@ def run(data,
 
     # Plots
     if plots:
-        confusion_matrix.plot(save_dir=save_dir, names=list(names.values()))
+        # confusion_matrix.plot(save_dir=save_dir, names=list(names.values()))
         loggers.on_val_end()
+
+    if do_3d:
+        from utils.show_2d3d_box import show_2d3d_box
+        # conf_thres = AP50_F1_max_idx / 1000.0
+        conf_thres = 0.5
+        # conf_thres = 0
+        final_preds_3d = [pred[pred[:, 15] >= conf_thres] for pred in preds_3d]
+
+        print("writing 3D BBoxes")
+        show_2d3d_box(final_preds_3d, labels_3d, img_paths, data["names"], save_dir, True)
 
     # Save JSON
     if save_json and len(jdict):
@@ -313,6 +450,7 @@ def parse_opt():
     parser.add_argument('--name', default='exp', help='save to project/name')
     parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')
     parser.add_argument('--half', action='store_true', help='use FP16 half-precision inference')
+    parser.add_argument('--do-3d', action='store_true', help='')
     opt = parser.parse_args()
     opt.save_json |= opt.data.endswith('coco.yaml')
     opt.save_txt |= opt.save_hybrid

@@ -8,6 +8,7 @@ import argparse
 import sys
 from copy import deepcopy
 from pathlib import Path
+import torch.nn.functional as F
 
 FILE = Path(__file__).absolute()
 sys.path.append(FILE.parents[1].as_posix())  # add yolov5/ to path
@@ -35,7 +36,7 @@ class Detect(nn.Module):
     def __init__(self, nc=80, anchors=(), ch=(), inplace=True):  # detection layer
         super().__init__()
         self.nc = nc  # number of classes
-        self.no = nc + 5  # number of outputs per anchor
+        self.no = nc + 5 + 3 + 6  # number of outputs per anchor, 3:HWL, 6: cos1,sin1,cos2,sin2,conf1,conf2
         self.nl = len(anchors)  # number of detection layers
         self.na = len(anchors[0]) // 2  # number of anchors
         self.grid = [torch.zeros(1)] * self.nl  # init grid
@@ -61,6 +62,9 @@ class Detect(nn.Module):
                 if self.inplace:
                     y[..., 0:2] = (y[..., 0:2] * 2. - 0.5 + self.grid[i]) * self.stride[i]  # xy
                     y[..., 2:4] = (y[..., 2:4] * 2) ** 2 * self.anchor_grid[i]  # wh
+                    y[..., 9:12] = torch.exp(y[..., 9:12])
+                    orint = y[..., 12:16].reshape(y.shape[0], y.shape[1], y.shape[2], y.shape[3], 2, 2)
+                    y[..., 12:16] = F.normalize(orint, dim=4).reshape(y.shape[0], y.shape[1], y.shape[2], y.shape[3], 4)
                 else:  # for YOLOv5 on AWS Inferentia https://github.com/ultralytics/yolov5/pull/2953
                     xy = (y[..., 0:2] * 2. - 0.5 + self.grid[i]) * self.stride[i]  # xy
                     wh = (y[..., 2:4] * 2) ** 2 * self.anchor_grid[i].view(1, self.na, 1, 1, 2)  # wh
@@ -184,7 +188,7 @@ class Model(nn.Module):
         for mi, s in zip(m.m, m.stride):  # from
             b = mi.bias.view(m.na, -1)  # conv.bias(255) to (3,85)
             b.data[:, 4] += math.log(8 / (640 / s) ** 2)  # obj (8 objects per 640 image)
-            b.data[:, 5:] += math.log(0.6 / (m.nc - 0.99)) if cf is None else torch.log(cf / cf.sum())  # cls
+            b.data[:, 5:9] += math.log(0.6 / (m.nc - 0.99)) if cf is None else torch.log(cf / cf.sum())  # cls
             mi.bias = torch.nn.Parameter(b.view(-1), requires_grad=True)
 
     def _print_biases(self):

@@ -13,7 +13,7 @@ import cv2
 import traceback
 from multiprocessing.pool import Pool
 
-from scripts.utils import Data, detect_data, \
+from utils import Data, detect_data, \
     read_kitti_ext, read_kitti_cal, get_camera_3d_8points_g2c, \
     project_3d_world, color_list
 
@@ -163,7 +163,9 @@ def attributes_3d_keypoint_preprocess(img_paths, labels, save_keypoint):
 
     # (type_id, truncated, occluded, alpha,xc, yc, w, h, H, W, L, X, Y, Z, ry)
     # to
-    # (type_id, truncated, occluded, alpha, xc, yc, w, h, H, W, L, X, Y, Z, ry, cos, sin, confidence, bbcp_x, bbcp_y)
+    # (type_id, truncated, occluded, alpha, xc, yc, w, h, H, W, L, X, Y, Z, ry, cos1, sin1, cos2, sin2, conf1, conf2)
+    # if save keypoint
+    # (type_id, truncated, occluded, alpha, xc, yc, w, h, H, W, L, X, Y, Z, ry, cos1, sin1, cos2, sin2, conf1, conf2, keypoint_x, keypoint_y)
     labels_tmp = []
     if save_keypoint:
         for label, orientation, confidence, keypoint in zip(labels, orientations, confidences, keypoints):
@@ -176,15 +178,18 @@ def attributes_3d_keypoint_preprocess(img_paths, labels, save_keypoint):
                 np.concatenate((label, orientation.reshape(-1, bins*2), confidence), axis=1)
             )
 
-    # (type_id, truncated, occluded, alpha, xc, yc, w, h, H, W, L, X, Y, Z, ry, cos, sin, confidence, bbcp_x, bbcp_y)
+    # (type_id, truncated, occluded, alpha, xc, yc, w, h, H, W, L, X, Y, Z, ry, cos1, sin1, cos2, sin2, conf1, conf2)
+    # if save keypoint
+    # (type_id, truncated, occluded, alpha, xc, yc, w, h, H, W, L, X, Y, Z, ry, cos1, sin1, cos2, sin2, conf1, conf2, keypoint_x, keypoint_y)
     # to
-    # # (type_id, xc, yc, w, h, H, W, L, X, Y, Z, ry, cos, sin, confidence, bbcp_x, bbcp_y, truncated, occluded, alpha)
+    # (type_id, xc, yc, w, h, H, W, L, X, Y, Z, ry, cos1, sin1, cos2, sin2, conf1, conf2, truncated, occluded, alpha)
+    # if save keypoint
+    # (type_id, xc, yc, w, h, H, W, L, X, Y, Z, ry, cos1, sin1, cos2, sin2, conf1, conf2, keypoint_x, keypoint_y, truncated, occluded, alpha)
     labels_final = []
     for idx, label in enumerate(labels_tmp):
         tmp = label[:, 1:4]
         label = np.delete(label, [1, 2, 3], axis=1)
         labels_final.append(np.concatenate((label, tmp), axis=1))
-
 
     return labels_final
 
@@ -267,7 +272,7 @@ def main(args):
                         print("failed")
             pbar.close()
 
-        if convert_type == "MONO_3D":
+        if convert_type == "MONO_2.5D":
             # 1. 将所有图像和labels保存在list中
             # 2. 使用数据处理代码处理 list(image_paths)和list(labels)
             save_keypoint = False
@@ -292,7 +297,7 @@ def main(args):
                 lb_name = osp.basename(im_path).replace("jpg", "txt")
                 np.savetxt(osp.join(new_labels_path, lb_name), lb, delimiter=" ", fmt='%.08f')
 
-        if convert_type == "MONO_3D_KEYPOINT":
+        if convert_type == "MONO_2.5D_KEYPOINT":
             # 1. 将所有图像和labels保存在list中
             # 2. 使用数据处理代码处理 list(image_paths)和list(labels)
             save_keypoint = True
@@ -322,10 +327,10 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    # parser.add_argument('--rope3d_path', default='../datasets/mini_rope3d/labels_raw')
-    parser.add_argument('--rope3d_path',default='../datasets/Rope3D/labels_raw')
-    # parser.add_argument('--convert_type', default="MONO_3D")
-    parser.add_argument('--convert_type', default="MONO_3D_KEYPOINT")
+    parser.add_argument('--rope3d_path', default='../datasets/mini_rope3d/labels_raw')
+    # parser.add_argument('--rope3d_path',default='../datasets/Rope3D/labels_raw')
+    parser.add_argument('--convert_type', default="MONO_2.5D")
+    # parser.add_argument('--convert_type', default="MONO_2.5D_KEYPOINT")
     parser.add_argument('--task', default=["train", "val"])
     args = parser.parse_args()
     print(args)

@@ -216,9 +216,9 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
 
         if not resume:
             labels = np.concatenate(dataset.labels, 0)
-            # c = torch.tensor(labels[:, 0])  # classes
-            # cf = torch.bincount(c.long(), minlength=nc) + 1.  # frequency
-            # model._initialize_biases(cf.to(device))
+            c = torch.tensor(labels[:, 0])  # classes
+            cf = torch.bincount(c.long(), minlength=nc) + 1.  # frequency
+            model._initialize_biases(cf.to(device))
             # if plots:
             #     plot_labels(labels, names, save_dir, loggers)
 
@@ -235,6 +235,9 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
     hyp['box'] *= 3. / nl  # scale to layers
     hyp['cls'] *= nc / 80. * 3. / nl  # scale to classes and layers
     hyp['obj'] *= (imgsz / 640) ** 2 * 3. / nl  # scale to image size and layers
+    hyp['dim'] *= 3. / nl
+    hyp['orint'] *= 3. / nl
+    hyp['conf'] *= 3. / nl
     hyp['label_smoothing'] = opt.label_smoothing
     model.nc = nc  # attach number of classes to model
     model.hyp = hyp  # attach hyperparameters to model
@@ -276,11 +279,11 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
         # b = int(random.uniform(0.25 * imgsz, 0.75 * imgsz + gs) // gs * gs)
         # dataset.mosaic_border = [b - imgsz, -b]  # height, width borders
 
-        mloss = torch.zeros(3, device=device)  # mean losses
+        mloss = torch.zeros(6, device=device)  # mean losses
         if RANK != -1:
             train_loader.sampler.set_epoch(epoch)
         pbar = enumerate(train_loader)
-        LOGGER.info(('\n' + '%10s' * 7) % ('Epoch', 'gpu_mem', 'box', 'obj', 'cls', 'labels', 'img_size'))
+        LOGGER.info(('\n' + '%10s' * 10) % ('Epoch', 'gpu_mem', 'box', 'obj', 'cls', 'dim', 'orint', 'conf', 'labels', 'img_size'))
         if RANK in [-1, 0]:
             pbar = tqdm(pbar, total=nb)  # progress bar
         optimizer.zero_grad()
@@ -293,6 +296,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
                 xi = [0, nw]  # x interp
                 # compute_loss.gr = np.interp(ni, xi, [0.0, 1.0])  # iou loss ratio (obj_loss = 1.0 or iou)
                 accumulate = max(1, np.interp(ni, xi, [1, nbs / batch_size]).round())
+                # accumulate = 0
                 for j, x in enumerate(optimizer.param_groups):
                     # bias lr falls from 0.1 to lr0, all other lrs rise from 0.0 to lr0
                     x['lr'] = np.interp(ni, xi, [hyp['warmup_bias_lr'] if j == 2 else 0.0, x['initial_lr'] * lf(epoch)])
@@ -332,7 +336,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
             if RANK in [-1, 0]:
                 mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
                 mem = f'{torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0:.3g}G'  # (GB)
-                pbar.set_description(('%10s' * 2 + '%10.4g' * 5) % (
+                pbar.set_description(('%10s' * 2 + '%10.4g' * 8) % (
                     f'{epoch}/{epochs - 1}', mem, *mloss, targets.shape[0], imgs.shape[-1]))
                 loggers.on_train_batch_end(ni, model, imgs, targets, paths, plots)
 
@@ -349,7 +353,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
             final_epoch = epoch + 1 == epochs
             if epoch % 10 == 0 or final_epoch:  # Calculate mAP
                 results, maps, _ = val.run(data_dict,
-                                           batch_size=batch_size // WORLD_SIZE * 2,
+                                           batch_size=16,
                                            imgsz=imgsz,
                                            model=ema.ema,
                                            single_cls=single_cls,
@@ -359,7 +363,8 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
                                            verbose=nc < 50 and final_epoch,
                                            plots=plots and final_epoch,
                                            loggers=loggers,
-                                           compute_loss=compute_loss)
+                                           compute_loss=compute_loss,
+                                           do_3d=True)
 
             # Update best mAP
             fi = fitness(np.array(results).reshape(1, -1))  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
@@ -485,7 +490,7 @@ def main(opt):
         assert not opt.sync_bn, '--sync-bn known training issue, see https://github.com/ultralytics/yolov5/issues/3998'
         torch.cuda.set_device(LOCAL_RANK)
         device = torch.device('cuda', LOCAL_RANK)
-        dist.init_process_group(backend="nccl" if dist.is_nccl_available() else "gloo", timeout=timedelta(seconds=60))
+        dist.init_process_group(backend="nccl" if dist.is_nccl_available() else "gloo", timeout=timedelta(seconds=3600))
 
     # Train
     if not opt.evolve:

@@ -96,6 +96,8 @@ class ComputeLoss:
         # Define criteria
         BCEcls = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([h['cls_pw']], device=device))
         BCEobj = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([h['obj_pw']], device=device))
+        BCEconf = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([h['conf_pw']], device=device))
+        self.Dimloss = nn.MSELoss().cuda()
 
         # Class label smoothing https://arxiv.org/pdf/1902.04103.pdf eqn 3
         self.cp, self.cn = smooth_BCE(eps=h.get('label_smoothing', 0.0))  # positive, negative BCE targets
@@ -108,14 +110,15 @@ class ComputeLoss:
         det = model.module.model[-1] if is_parallel(model) else model.model[-1]  # Detect() module
         self.balance = {3: [4.0, 1.0, 0.4]}.get(det.nl, [4.0, 1.0, 0.25, 0.06, .02])  # P3-P7
         self.ssi = list(det.stride).index(16) if autobalance else 0  # stride 16 index
-        self.BCEcls, self.BCEobj, self.gr, self.hyp, self.autobalance = BCEcls, BCEobj, 1.0, h, autobalance
+        self.BCEcls, self.BCEobj, self.BCEconf, self.gr, self.hyp, self.autobalance = BCEcls, BCEobj, BCEconf, 1.0, h, autobalance
         for k in 'na', 'nc', 'nl', 'anchors':
             setattr(self, k, getattr(det, k))
 
     def __call__(self, p, targets):  # predictions, targets, model
         device = targets.device
-        lcls, lbox, lobj = torch.zeros(1, device=device), torch.zeros(1, device=device), torch.zeros(1, device=device)
-        tcls, tbox, indices, anchors = self.build_targets(p, targets)  # targets
+        lcls, lbox, lobj, ldim, lorint, lconf = torch.zeros(1, device=device), torch.zeros(1, device=device), torch.zeros(1, device=device), \
+                                                torch.zeros(1, device=device), torch.zeros(1, device=device), torch.zeros(1, device=device)
+        tcls, tbox, tdim, torint, tconf, indices, anchors = self.build_targets(p, targets)  # targets
 
         # Losses
         for i, pi in enumerate(p):  # layer index, layer predictions
@@ -142,13 +145,20 @@ class ComputeLoss:
 
                 # Classification
                 if self.nc > 1:  # cls loss (only if multiple classes)
-                    t = torch.full_like(ps[:, 5:], self.cn, device=device)  # targets
+                    t = torch.full_like(ps[:, 5:9], self.cn, device=device)  # targets
                     t[range(n), tcls[i]] = self.cp
-                    lcls += self.BCEcls(ps[:, 5:], t)  # BCE
+                    lcls += self.BCEcls(ps[:, 5:9], t)  # BCE
 
                 # Append targets to text file
                 # with open('targets.txt', 'a') as file:
                 #     [file.write('%11.5g ' * 4 % tuple(x) + '\n') for x in torch.cat((txy[i], twh[i]), 1)]
+
+                # dim
+                ldim += self.Dimloss(ps[:, 9:12], tdim[i].log())
+                # orient
+                lorint += self.orientation_loss(ps[:, 12:16], torint[i], tconf[i])
+                # conf
+                lconf += self.BCEconf(ps[:, 16:18], tconf[i])  # BCE
 
             obji = self.BCEobj(pi[..., 4], tobj)
             lobj += obji * self.balance[i]  # obj loss
@@ -160,15 +170,18 @@ class ComputeLoss:
         lbox *= self.hyp['box']
         lobj *= self.hyp['obj']
         lcls *= self.hyp['cls']
+        ldim *= self.hyp['dim']
+        lorint *= self.hyp['orint']
+        lconf *= self.hyp['conf']
         bs = tobj.shape[0]  # batch size
 
-        return (lbox + lobj + lcls) * bs, torch.cat((lbox, lobj, lcls)).detach()
+        return (lbox + lobj + lcls + ldim + lorint+ lconf ) * bs, torch.cat((lbox, lobj, lcls, ldim, lorint, lconf)).detach()
 
     def build_targets(self, p, targets):
         # Build targets for compute_loss(), input targets(image,class,x,y,w,h)
         na, nt = self.na, targets.shape[0]  # number of anchors, targets
-        tcls, tbox, indices, anch = [], [], [], []
-        gain = torch.ones(7, device=targets.device)  # normalized to gridspace gain
+        tcls, tbox, tdim, torint, tconf, indices, anch = [], [], [], [], [], [], []
+        gain = torch.ones(23, device=targets.device)  # normalized to gridspace gain 1+5+1, 1+21+1
         ai = torch.arange(na, device=targets.device).float().view(na, 1).repeat(1, nt)  # same as .repeat_interleave(nt)
         targets = torch.cat((targets.repeat(na, 1, 1), ai[:, :, None]), 2)  # append anchor indices
 
@@ -210,11 +223,43 @@ class ComputeLoss:
             gij = (gxy - offsets).long()
             gi, gj = gij.T  # grid xy indices
 
+            hwl = t[:, 6:9]
+            orint = t[:, 13:17]
+            conf = t[:, 17:19]
+
             # Append
-            a = t[:, 6].long()  # anchor indices
+            a = t[:, -1].long()  # anchor indices
             indices.append((b, a, gj.clamp_(0, gain[3].type(torch.int64) - 1), gi.clamp_(0, gain[2].type(torch.int64) - 1)))  # image, anchor, grid indices
             tbox.append(torch.cat((gxy - gij, gwh), 1))  # box
             anch.append(anchors[a])  # anchors
             tcls.append(c)  # class
+            tdim.append(hwl) # hwl
+            torint.append(orint) # orintation
+            tconf.append(conf)
 
-        return tcls, tbox, indices, anch
+        return tcls, tbox, tdim, torint, tconf, indices, anch
+
+    def orientation_loss(self, pred_orient, target_orients, target_confs):
+        num_pos = target_orients.shape[0]
+        if num_pos > 0:
+
+            pred_orient_pos = pred_orient.reshape([-1, 2, 2])
+            target_orients_pos = target_orients.reshape([-1, 2, 2])
+            target_confs_pos = target_confs.reshape([-1, 2])
+
+            _, select_orint_idx = torch.max(target_confs_pos, 1)
+            select_pred_orient = torch.zeros(pred_orient_pos.shape[0], 2).to(pred_orient_pos.device)
+            select_target_orient = torch.zeros(pred_orient_pos.shape[0], 2).to(pred_orient_pos.device)
+            for i in range(len(pred_orient_pos)):
+                select_pred_orient[i, :] =  pred_orient_pos[i, select_orint_idx[i]]
+                select_target_orient[i, :] = target_orients_pos[i, select_orint_idx[i]]
+
+            pred_angle_diff = torch.atan2(select_pred_orient[:, 1], select_pred_orient[:, 0])
+            target_angle_diff = torch.atan2(select_target_orient[:, 1], select_target_orient[:, 0])
+
+            loss_orient = -1* torch.cos(target_angle_diff - pred_angle_diff).mean()
+
+        else:
+            loss_orient = pred_orient.sum() * 0
+
+        return loss_orient.to(torch.float64)
